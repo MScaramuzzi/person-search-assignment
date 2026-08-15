@@ -292,6 +292,7 @@ def train_detector(
     amp: bool = True,
     resume: bool = True,
     seed: int = 42,
+    stop_file: str | None = "STOP",
 ) -> str:
     """Fine-tune the detector, checkpointing and logging every epoch.
 
@@ -300,6 +301,13 @@ def train_detector(
     0.5, score >= 0.5 -- never COCO mAP (see ``det_eval``).  Colab sessions die,
     so every epoch writes a checkpoint and a CSV row, and ``resume`` picks up
     from the last one.
+
+    ``stop_file`` is a name inside ``out_dir``: create that file and the loop
+    finishes the current epoch, saves, and returns.  Colab's interrupt button
+    cannot stop a run whose main thread is blocked in CUDA or waiting on
+    DataLoader workers, and no second cell can run while the first one is
+    executing -- but ``out_dir`` lives on Drive, so the file can be created from
+    outside the session entirely.  Pass ``None`` to disable.
     """
     # Works whether the caller put ``src/`` on sys.path or imports ``src.detector``.
     try:
@@ -383,10 +391,17 @@ def train_detector(
             torch.save({"model": model.state_dict(), "epoch": epoch, "recall": best_recall}, best_path)
             print(f"  new best: recall@0.5 = {best_recall:.4f} (epoch {epoch})")
 
+        # Checked after the checkpoint is written, so stopping never costs an epoch.
+        if stop_file and os.path.exists(os.path.join(out_dir, stop_file)):
+            print(f"  {stop_file} found in {out_dir} -- stopping after epoch {epoch}")
+            break
+
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump(
             {
-                "epochs": epochs, "batch_size": batch_size, "lr": lr,
+                "epochs_planned": epochs,
+                "epochs_completed": locals().get("epoch", start_epoch - 1),
+                "batch_size": batch_size, "lr": lr,
                 "milestones": list(milestones), "seed": seed,
                 "torch": torch.__version__, "torchvision": torchvision.__version__,
                 "best_recall@0.5": best_recall,
