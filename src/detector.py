@@ -175,6 +175,28 @@ def load_detections(path: str) -> dict[str, np.ndarray]:
         return {str(n): dets[off[i]: off[i + 1]] for i, n in enumerate(z["names"])}
 
 
+def load_checkpoint(path: str, map_location=None) -> dict:
+    """``torch.load`` that works on both the local torch 1.12 and Colab's 2.x.
+
+    torch >= 2.6 defaults to ``weights_only=True``, which refuses the
+    ``collections.Counter`` inside ``MultiStepLR.state_dict()`` -- resuming a run
+    would die on the scheduler, not the weights.  torch 1.12 has no such kwarg
+    and forwards it to pickle, hence the fallback.
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _grad_scaler():
+    """AMP scaler across torch versions (``torch.cuda.amp`` is deprecated in 2.4+)."""
+    try:
+        return torch.amp.GradScaler("cuda")
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler()
+
+
 def train_one_epoch(model, loader, optimizer, device, epoch: int, scaler=None,
                     print_every: int = 100, clip_norm: float | None = 10.0) -> dict:
     """One pass over the training frames; returns the mean of each loss term."""
@@ -274,8 +296,13 @@ def train_detector(
     so every epoch writes a checkpoint and a CSV row, and ``resume`` picks up
     from the last one.
     """
-    from seed import loader_generator, set_seed, worker_init_fn
-    from det_eval import recall_at_iou
+    # Works whether the caller put ``src/`` on sys.path or imports ``src.detector``.
+    try:
+        from seed import loader_generator, set_seed, worker_init_fn
+        from det_eval import recall_at_iou
+    except ImportError:
+        from src.seed import loader_generator, set_seed, worker_init_fn
+        from src.det_eval import recall_at_iou
 
     set_seed(seed)
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -296,11 +323,11 @@ def train_detector(
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=list(milestones), gamma=0.1)
-    scaler = torch.cuda.amp.GradScaler() if (amp and device.type == "cuda") else None
+    scaler = _grad_scaler() if (amp and device.type == "cuda") else None
 
     start_epoch, best_recall = 1, -1.0
     if resume and os.path.exists(last_path):
-        ckpt = torch.load(last_path, map_location=device)
+        ckpt = load_checkpoint(last_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
