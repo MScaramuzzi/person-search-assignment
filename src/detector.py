@@ -142,17 +142,22 @@ def predict(
     )
     out: list[np.ndarray] = []
     use_amp = amp and device.type == "cuda"
-    for i, (images, _) in enumerate(loader, 1):
-        images = [im.to(device, non_blocking=True) for im in images]
-        with torch.autocast("cuda", enabled=use_amp):
-            preds = model(images)
-        for p in preds:
-            keep = p["labels"] == keep_label
-            boxes = p["boxes"][keep].float().cpu().numpy()
-            scores = p["scores"][keep].float().cpu().numpy()[:, None]
-            out.append(np.hstack([boxes, scores]).astype(np.float32))
-        if progress_every and i % progress_every == 0:
-            print(f"  {i * batch_size}/{len(dataset)} frames", flush=True)
+    # inference_mode, not just eval(): this same function runs the end-of-epoch
+    # validation pass while the optimiser state is still resident on the GPU, and
+    # building an autograd graph for 1500x900 frames there is how a T4 runs out
+    # of memory eight minutes into epoch 1.
+    with torch.inference_mode():
+        for i, (images, _) in enumerate(loader, 1):
+            images = [im.to(device, non_blocking=True) for im in images]
+            with torch.autocast("cuda", enabled=use_amp):
+                preds = model(images)
+            for p in preds:
+                keep = p["labels"] == keep_label
+                boxes = p["boxes"][keep].float().cpu().numpy()
+                scores = p["scores"][keep].float().cpu().numpy()[:, None]
+                out.append(np.hstack([boxes, scores]).astype(np.float32))
+            if progress_every and i % progress_every == 0:
+                print(f"  {i * batch_size}/{len(dataset)} frames", flush=True)
     return out
 
 
@@ -227,9 +232,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch: int, scaler=None,
             optimizer.step()
 
         n += 1
-        sums["loss"] = sums.get("loss", 0.0) + float(loss)
+        sums["loss"] = sums.get("loss", 0.0) + loss.detach().item()
         for k, v in losses.items():
-            sums[k] = sums.get(k, 0.0) + float(v)
+            sums[k] = sums.get(k, 0.0) + v.detach().item()
         if print_every and it % print_every == 0:
             print(
                 f"  ep {epoch} it {it}/{len(loader)}  loss {sums['loss'] / n:.4f}  "
@@ -266,7 +271,7 @@ def overfit_smoke(model, dataset, device, n_frames: int = 8, iters: int = 20, lr
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            history.append(float(loss))
+            history.append(loss.detach().item())
             it += 1
     return history
 
